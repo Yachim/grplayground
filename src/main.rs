@@ -9,6 +9,7 @@ fn main() {
         .insert_resource(WindowData::default())
         .insert_resource(CamData::default())
         .insert_resource(SpacetimeParams::default())
+        .insert_resource(Msaa::default())
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
@@ -33,6 +34,7 @@ const INPUT_BG_COLOR: Color = Color::rgb(0.15, 0.15, 0.15);
 const SIDEBAR_BG_COLOR: Color = Color::rgba(0.1, 0.1, 0.1, 0.9);
 
 const FONT_PATH: &str = "fonts/noto_sans/static/NotoSans-Regular.ttf";
+const FONT_PATH_BOLD: &str = "fonts/noto_sans/static/NotoSans-Bold.ttf";
 
 const NEWTON_CONSTANT: f32 = 6.67e-11;
 const LIGHT_SPEED: f32 = 299_792_458.;
@@ -98,9 +100,8 @@ struct SchwarzschildMaterial {
     accretion_disc_width: f32,
     #[uniform(22)]
     accretion_disc_intensity: f32,
-
     #[uniform(23)]
-    time: f32,
+    accretion_disc_phi: f32,
 }
 
 impl Material2d for SchwarzschildMaterial {
@@ -121,7 +122,7 @@ fn update_material(
     mat.cam_x = cam_data.cam_x;
     mat.cam_y = cam_data.cam_y;
     mat.cam_z = cam_data.cam_z;
-    mat.time = time_to_geo(time.elapsed_seconds(), spacetime_params.mass) as f32;
+    mat.accretion_disc_phi = mat.accretion_disc_phi + (time_to_geo(time.delta_seconds(), spacetime_params.mass) as f32 / (mat.accretion_disc_r * mat.accretion_disc_r.sqrt())) % (2. * PI);
 }
 /* #endregion */
 
@@ -129,7 +130,7 @@ fn update_material(
 fn get_cam_axis(pos: Vec3, target: Vec3) -> (Vec3, Vec3, Vec3) {
     let cam_z = (target - pos).normalize_or_zero();
     
-    let xz = vec3(cam_z.x, 0., cam_z.z).normalize_or_zero();
+    let xz = vec3(cam_z.x, 0., cam_z.z).try_normalize().unwrap_or(Vec3::X);
     let cam_x = Quat::from_axis_angle(Vec3::Y, - PI / 2.).mul_vec3(xz);
 
     let cam_y = Quat::from_axis_angle(cam_x, PI / 2.).mul_vec3(cam_z);
@@ -143,10 +144,10 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SchwarzschildMaterial>>,
     assets: Res<AssetServer>,
-    time: Res<Time>,
     spacetime_params: Res<SpacetimeParams>
 ) {
     let font: Handle<Font> = assets.load(FONT_PATH);
+    let font_bold: Handle<Font> = assets.load(FONT_PATH_BOLD);
 
     let cam_pos = vec3(0., 10., 40.);
     let cam_target = Vec3::ZERO;
@@ -196,8 +197,7 @@ fn setup(
                     accretion_disc_r: 6.,
                     accretion_disc_width: 12.,
                     accretion_disc_intensity: 0.8,
-
-                    time: time_to_geo(time.elapsed_seconds(), spacetime_params.mass) as f32,
+                    accretion_disc_phi: 0.,
                 }),
                 ..default()
             }
@@ -276,7 +276,7 @@ fn setup(
                         color: TEXT_COLOR,
                         ..default()
                     })
-                    .with_value(spacetime_params.mass.to_string())
+                    .with_value(format!("{:.2e}", spacetime_params.mass))
                     .with_inactive(true),
                 Name::new("SpacetimeParamsM")
             ));
@@ -533,15 +533,62 @@ fn setup(
         })
         .with_children(|builder| {
             builder.spawn((
-                TextBundle::from_section(
-                    "",
-                    TextStyle {
-                        font: font.clone(),
-                        font_size: 16.,
-                        color: Color::WHITE,
-                        ..default()
-                    }
-                ),
+                TextBundle::from_sections(vec![
+                    TextSection::new(
+                        "Schwarzschild radius: ",
+                        TextStyle {
+                            font: font_bold.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                    TextSection::new(
+                        "\n",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                    TextSection::new(
+                        "Difference in r from the event horizon: ",
+                        TextStyle {
+                            font: font_bold.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                    TextSection::new(
+                        "\n",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                    TextSection::new(
+                        "Proper length from the event horizon: ",
+                        TextStyle {
+                            font: font_bold.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                    TextSection::new(
+                        "",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.,
+                            color: Color::WHITE,
+                            ..default()
+                        }
+                    ),
+                ]),
                 PositionText
             ));
         });
@@ -557,8 +604,14 @@ fn focus(
         if *interaction == Interaction::Pressed {
             for (entity, mut inactive, mut border_color) in &mut text_input_query {
                 if entity == interaction_entity {
-                    inactive.0 = false;
-                    *border_color = INPUT_BORDER_COLOR_ACTIVE.into();
+                    if !inactive.0 {
+                        inactive.0 = true;
+                        *border_color = INPUT_BORDER_COLOR_INACTIVE.into();
+                    }
+                    else {
+                        inactive.0 = false;
+                        *border_color = INPUT_BORDER_COLOR_ACTIVE.into();
+                    }
                 } else {
                     inactive.0 = true;
                     *border_color = INPUT_BORDER_COLOR_INACTIVE.into();
@@ -640,7 +693,9 @@ fn update_position_text(
 
     let proper_length = length_to_si(r.sqrt() * (r - 2.).sqrt() + f32::ln(r + r.sqrt() * (r - 2.).sqrt() - 1.), spacetime_params.mass);
 
-    text.sections[0].value = format!("Schwarzschild radius: {rs}\nDifference in r from event horizon: {delta_r} m\nProper distance from event horizon: {proper_length} m");
+    text.sections[1].value = format!("{rs:.2e} m\n");
+    text.sections[3].value = format!("{delta_r:.2e} m\n");
+    text.sections[5].value = format!("{proper_length:.2e} m");
 }
 /* #endregion */
 

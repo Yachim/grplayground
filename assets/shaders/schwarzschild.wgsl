@@ -24,6 +24,7 @@ const PI = 3.141592653589793238462643383279;
 
 @group(2) @binding(13) var<uniform> fov: f32;
 
+// assuming cam_x, cam_y, cam_z is normalized
 @group(2) @binding(14) var<uniform> cam_pos: vec3<f32>;
 @group(2) @binding(15) var<uniform> cam_x: vec3<f32>; // cam right
 @group(2) @binding(16) var<uniform> cam_y: vec3<f32>; // camup
@@ -34,12 +35,11 @@ const PI = 3.141592653589793238462643383279;
 @group(2) @binding(20) var<uniform> accretion_disc_r: f32;
 @group(2) @binding(21) var<uniform> accretion_disc_width: f32;
 @group(2) @binding(22) var<uniform> accretion_disc_intensity: f32;
+@group(2) @binding(23) var<uniform> accretion_disc_phi: f32;
 
-@group(2) @binding(23) var<uniform> time: f32;
-
-const STEP_CNT = 50;
+const STEP_CNT = 200;
 const MAX_ORBITS = 2;
-const STEP_SIZE = f32(MAX_ORBITS) * 2. * PI / f32(STEP_CNT);
+const DEFAULT_STEP_SIZE = f32(MAX_ORBITS) * 2. * PI / f32(STEP_CNT);
 
 const UP = vec3(0., 1., 0.);
 const DOWN = vec3(0., -1., 0.);
@@ -52,28 +52,57 @@ fn second_derivative(u: f32) -> f32 {
     return u * (3. * u - 1.);
 }
 
-struct EulerOut {
+struct IntegrationStep {
     u: f32,
     v: f32,
 }
 
-fn euler(u: f32, v: f32, delta: f32) -> EulerOut {
+fn euler(u: f32, v: f32, delta: f32) -> IntegrationStep {
     let a = second_derivative(u);
+
     let new_v = v + a * delta;
     let new_u = u + v * delta;
 
-    return EulerOut(new_u, new_v);
+    return IntegrationStep(new_u, new_v);
+}
+
+fn leapfrog(u: f32, v: f32, delta: f32) -> IntegrationStep {
+    let v_intermediate = v + second_derivative(u) * delta / 2;
+    let new_u = u + v_intermediate * delta;        
+    let new_v = v_intermediate + second_derivative(new_u) * delta / 2;
+
+    return IntegrationStep(new_u, new_v);
+}
+
+fn integrate_step(u: f32, v: f32, delta: f32) -> IntegrationStep {
+    //return euler(u, v, delta);
+    return leapfrog(u, v, delta);
+}
+
+struct Intersection {
+    intersects: bool,
+    point: vec3<f32>
+}
+
+fn ray_plane_intersect(ray_direction: vec3<f32>, ray_origin: vec3<f32>, normal_: vec3<f32>, plane_center: vec3<f32>) -> Intersection {
+    var normal = normal_;
+    if dot(ray_direction, normal) < 0. {
+        normal = -normal;
+    }
+
+    // source: https://www.scratchapixel.com/lessons/3d-basic-rendering/minimal-ray-tracer-rendering-simple-shapes/ray-plane-and-ray-disk-intersection.html
+    let denom = dot(ray_direction, normal);
+    if denom > 1e-6 {
+        let t = dot(plane_center - ray_origin, normal) / denom;
+        return Intersection(t >= 0., ray_origin + t * ray_direction);
+    }
+
+    return Intersection(false, vec3(0., 0., 0.));
 }
 
 struct CubemapOut {
     coords: vec2<f32>,
     direction: i32
-}
-
-fn ray_plane_intersect(ray_direction: vec3<f32>, ray_origin: vec3<f32>, normal: vec3<f32>, plane_center: vec3<f32>) -> vec3<f32> {
-    // source: https://www.scratchapixel.com/lessons/3d-basic-rendering/minimal-ray-tracer-rendering-simple-shapes/ray-plane-and-ray-disk-intersection.html
-    let t = dot(plane_center - ray_origin, normal) / dot(ray_direction, normal);
-    return ray_origin + t * ray_direction;
 }
 
 fn to_cubemap(v_: vec3<f32>) -> CubemapOut {
@@ -165,76 +194,85 @@ fn to_cubemap(v_: vec3<f32>) -> CubemapOut {
     return CubemapOut(coords, direction);
 }
 
+fn construct_ray(uv: vec2<f32>) -> vec3<f32> {
+    let fov_mult = 1. / tan(fov / 2.);
+    return normalize((uv.x * cam_x) + (uv.y * cam_y) + (fov_mult * cam_z));
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
-    let fov_mult = 1. / tan(fov / 2.);
-
     var uv = mesh.uv;
     uv.y = 1. - uv.y;
     uv *= 2.;
     uv -= 1.;
 
-    var ray = normalize((uv.x * cam_x) + (uv.y * cam_y) + (fov_mult * cam_z));
+    var ray = construct_ray(uv);
 
-    let r_c = length(cam_pos);
+    let cam_normal = normalize(cam_pos);
+    let cam_tangent = normalize(cross(cross(cam_normal, ray), cam_normal));
 
-    let n = normalize(cam_pos);
-    let t = normalize(cross(cross(n, ray), n));
-
-    let u0 = 1. / r_c;
-    let v0 = -u0 * (dot(ray, n) / dot(ray, t));
+    let u0 = 1. / length(cam_pos);
+    let v0 = -u0 * (dot(ray, cam_normal) / dot(ray, cam_tangent));
 
     var u = u0;
     var v = v0;
 
+    var prev_pos = cam_pos;
     var pos = cam_pos;
     var phi: f32 = 0.;
     var out_color = vec4(0., 0., 0., 1.);
 
     let accretion_disc_max_r = accretion_disc_r + accretion_disc_width;
 
-    let accretion_disc_rotated: f32 = time / (accretion_disc_r * sqrt(accretion_disc_r));
+    let step_size = DEFAULT_STEP_SIZE;
 
+    var accretion_disc_hit = false;
     for (var i = 0; i < STEP_CNT; i++) {
         if u >= 0.5 {
             out_color += vec4(0., 0., 0., 1.);
             return out_color;
         }
 
-        if u < 0. {
+        if u <= 0. {
             break;
         }
 
-        let euler_out = euler(u, v, STEP_SIZE);
-        u = euler_out.u;
-        v = euler_out.v;
-        phi += STEP_SIZE;
-        let new_pos = (cos(phi) * n + sin(phi) * t) / u;
-        ray = normalize(new_pos - pos);
+        prev_pos = pos;
+
+        let integration_step = integrate_step(u, v, step_size);
+        u = integration_step.u;
+        v = integration_step.v;
+        phi += step_size;
+        pos = (cos(phi) * cam_normal + sin(phi) * cam_tangent) / u;
+        ray = normalize(pos - prev_pos);
 
         // accretion disc
         if (
-            (cam_pos.y > 0. && pos.y > 0. && new_pos.y < 0.) ||
-            (cam_pos.y < 0. && pos.y < 0. && new_pos.y > 0.) // if I don't do this, it glitches out, there is another disc when the camera turns around.
+            (
+                (cam_pos.y > 0. && prev_pos.y > 0. && pos.y < 0.) ||
+                (cam_pos.y < 0. && prev_pos.y < 0. && pos.y > 0.)
+            ) && ( // this branch prevents the accretion disc to appear behind the camera
+                dot(-normalize(cam_pos), cam_z) > 0. || u > 1. / accretion_disc_max_r
+            )
         ) {
-            var plane_normal = vec3(0., 1., 0.);
-
-            let point = ray_plane_intersect(ray, pos, plane_normal, vec3(0., 0., 0.));
+            let point = ray_plane_intersect(ray, prev_pos, vec3(0., 1., 0.), vec3(0., 0., 0.)).point;
             let point_r = length(point);
 
-            if (point_r > accretion_disc_r && point_r < accretion_disc_max_r) {
-                var accretion_disc_phi = atan2(point.z, point.x);
-                accretion_disc_phi += accretion_disc_rotated;
-                accretion_disc_phi += PI;
-                accretion_disc_phi %= 2 * PI;
+            if (
+                point_r > accretion_disc_r &&
+                point_r < accretion_disc_max_r
+            ) {
+                var accretion_disc_texture_phi = atan2(point.z, point.x);
+                accretion_disc_texture_phi += accretion_disc_phi;
+                accretion_disc_texture_phi += PI;
+                accretion_disc_texture_phi %= 2 * PI;
 
-                let coords = vec2(accretion_disc_phi / (2 * PI), (accretion_disc_max_r - point_r) / accretion_disc_width);
+                let coords = vec2(accretion_disc_texture_phi / (2 * PI), (accretion_disc_max_r - point_r) / accretion_disc_width);
 
-                out_color += textureSample(accretion_disc_texture, accretion_disc_sampler, coords) * accretion_disc_intensity;
+                out_color += textureSample(accretion_disc_texture, accretion_disc_sampler, coords) * (accretion_disc_max_r - point_r) / accretion_disc_width * accretion_disc_intensity;
+                accretion_disc_hit = true;
             }
         }
-
-        pos = new_pos;
     }
 
     let cubemap = to_cubemap(ray);
