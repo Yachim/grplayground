@@ -27,7 +27,7 @@ const PI = 3.141592653589793238462643383279;
 // assuming cam_x, cam_y, cam_z is normalized
 @group(2) @binding(14) var<uniform> cam_pos: vec3<f32>;
 @group(2) @binding(15) var<uniform> cam_x: vec3<f32>; // cam right
-@group(2) @binding(16) var<uniform> cam_y: vec3<f32>; // camup
+@group(2) @binding(16) var<uniform> cam_y: vec3<f32>; // cam up
 @group(2) @binding(17) var<uniform> cam_z: vec3<f32>; // the way the camera is facing
 
 @group(2) @binding(18) var accretion_disc_texture: texture_2d<f32>;
